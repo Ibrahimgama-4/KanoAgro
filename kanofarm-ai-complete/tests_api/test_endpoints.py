@@ -1,0 +1,112 @@
+"""Endpoint tests (need FastAPI; run in CI). Supabase and the weather provider are replaced with fakes."""
+import base64, unittest
+from fastapi.testclient import TestClient
+from kanofarm.api import main
+from kanofarm.services.weather_client import WeatherService
+from tests.test_weather import payload
+from kanofarm.services.rainfall import RainfallService
+from tests.test_rainfall import daily, TODAY
+from datetime import timedelta
+
+FARM = "22222222-2222-2222-2222-222222222222"
+JPEG = base64.b64encode(b"\xff\xd8\xff\xe0" + b"0" * 50).decode()
+
+class FakeSB:
+    def __init__(self, roles=()):
+        self.roles, self.inserts = roles, []
+    def user(self, jwt): return {"id": "u1", "email": "a@b.c"} if jwt == "good" else None
+    def select(self, jwt, table, params=None):
+        params = params or {}
+        if table == "farms": return [{"id": FARM, "name": "F", "lga": "L", "ward": "W", "community": None, "size_ha": 2,
+                                      "irrigation_type": None, "latitude": 12.0, "longitude": 8.5}] if params.get("id") == f"eq.{FARM}" else []
+        if table == "farm_crops": return [{"id": "c1", "variety": None, "planting_date": "2026-06-15", "expected_harvest_date": None,
+                                           "crops": {"slug": "maize", "name_en": "Maize"}}]
+        if table == "user_roles": return [{"role": r} for r in self.roles]
+        return []
+    def insert(self, jwt, table, rows, **kw):
+        self.inserts.append((table, rows)); r = rows if isinstance(rows, dict) else (rows[0] if rows else {})
+        return [{**r, "id": "33333333-3333-3333-3333-333333333333"}]
+    def update(self, *a, **k): return [{}]
+    def upload(self, *a, **k): pass
+    def sign_url(self, *a, **k): return None
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeSB(); main.sb = lambda: self.fake
+        main.weather = WeatherService("https://x", fetch=lambda url: payload([0] * 7, [60, 0, 0, 0, 0, 0, 0]))
+        self.c = TestClient(main.app); self.h = {"Authorization": "Bearer good"}
+
+class Public(Base):
+    def test_static_and_health(self):
+        self.assertEqual(self.c.get("/api/health").json(), {"status": "ok"})
+        for p in ("/", "/manifest.webmanifest", "/sw.js", "/static/app.js", "/static/icons/icon-192.png"):
+            self.assertEqual(self.c.get(p).status_code, 200, p)
+    def test_config_never_leaks_secrets(self):
+        d = self.c.get("/api/config").json(); self.assertFalse({"anthropic_api_key", "service_role"} & set(d))
+    def test_weather(self):
+        self.assertEqual(self.c.get("/api/weather?lat=51.5&lon=-0.1").status_code, 422)
+        d = self.c.get("/api/weather?lat=12&lon=8.5").json()
+        self.assertEqual(d["meta"]["data_type"], "MODELLED"); self.assertIn("heavy_rain", [a["id"] for a in d["advisories"]])
+    def test_public_helpers(self):
+        self.assertIn("DRAFT", self.c.get("/api/crop-calendar").json()["banner"])
+        self.assertTrue(self.c.get("/api/sources").json()["sources"])
+        self.assertEqual(self.c.post("/api/soil/advice", json={"ph": 5}).status_code, 200)
+        self.assertEqual(self.c.post("/api/soil/advice", json={"ph": 99}).status_code, 422)
+
+class Auth(Base):
+    def test_requires_login(self):
+        for m, p in (("get", "/api/farms"), ("post", "/api/plant/scan"), ("get", "/api/history"), ("post", "/api/assistant"),
+                     ("get", f"/api/farms/{FARM}/dashboard"), ("post", "/api/admin/pesticides")):
+            self.assertEqual(getattr(self.c, m)(p, **({"json": {}} if m == "post" else {})).status_code, 401, p)
+        self.assertEqual(self.c.get("/api/farms", headers={"Authorization": "Bearer bad"}).status_code, 401)
+    def test_owner_comes_from_token_not_body(self):
+        r = self.c.post("/api/farms", headers=self.h, json={"name": "F", "latitude": 12, "longitude": 8, "owner_id": "evil"})
+        self.assertEqual(r.status_code, 200); self.assertEqual(self.fake.inserts[0][1]["owner_id"], "u1")
+    def test_bad_farm_rejected(self):
+        self.assertEqual(self.c.post("/api/farms", headers=self.h, json={"name": "F", "latitude": 99, "longitude": 8}).status_code, 422)
+    def test_other_users_farm_is_404(self):
+        self.assertEqual(self.c.get("/api/farms/44444444-4444-4444-4444-444444444444/dashboard", headers=self.h).status_code, 404)
+        self.assertEqual(self.c.get("/api/farms/not-a-uuid/dashboard", headers=self.h).status_code, 422)
+    def test_dashboard(self):
+        d = self.c.get(f"/api/farms/{FARM}/dashboard", headers=self.h).json()
+        self.assertEqual(d["crops"][0]["days_after_planting"], 101); self.assertIsNone(d["crops"][0]["stage"])
+        self.assertIn("flood risk", d["risks_not_computed"]); self.assertIn("heavy_rain", [a["id"] for a in d["advisories"]])
+        self.assertTrue(any(t == "alerts" for t, _ in self.fake.inserts))
+
+class Rainfall(Base):
+    def test_rainfall_since_planting(self):
+        main.rain = RainfallService("https://f", "https://a", today_fn=lambda: TODAY,
+                                    fetch=lambda u: daily(TODAY - timedelta(days=110), TODAY, lambda d: 1.0))
+        d = self.c.get(f"/api/farms/{FARM}/rainfall", headers=self.h).json()
+        self.assertEqual(d["crops"][0]["days"], 101); self.assertTrue(d["crops"][0]["complete"])
+        self.assertIn("not a rain-gauge", d["meta"]["note"])
+    def test_requires_login(self):
+        self.assertEqual(self.c.get(f"/api/farms/{FARM}/rainfall").status_code, 401)
+
+class Scan(Base):
+    def body(self, **q): return {"image_b64": JPEG, "quality": {"brightness": 120, "sharpness": 90, **q}}
+    def test_bad_quality_not_stored(self):
+        r = self.c.post("/api/plant/scan", headers=self.h, json=self.body(brightness=5)).json()
+        self.assertEqual(r["status"], "quality_failed"); self.assertFalse(self.fake.inserts)
+    def test_no_model_is_honest_and_saved(self):
+        r = self.c.post("/api/plant/scan", headers=self.h, json=self.body()).json()
+        self.assertEqual(r["status"], "model_unavailable"); self.assertNotIn("condition", r)
+        self.assertEqual([t for t, _ in self.fake.inserts], ["plant_scans", "diagnoses"])
+    def test_non_image_rejected(self):
+        r = self.c.post("/api/plant/scan", headers=self.h, json={"image_b64": base64.b64encode(b"hello").decode(),
+                                                                  "quality": {"brightness": 100, "sharpness": 100}})
+        self.assertEqual(r.status_code, 422)
+
+class Admin(Base):
+    PEST = dict(product_name="P", active_ingredient="A", registration_number="N", registration_status="registered",
+                target_crop="maize", target_pest_or_disease="t", source_name="S", last_verified="2026-09-01", expires_at="2027-03-01")
+    def test_non_admin_forbidden(self):
+        self.assertEqual(self.c.post("/api/admin/pesticides", headers=self.h, json=self.PEST).status_code, 403)
+        self.assertEqual(self.c.get("/api/admin/reviews", headers=self.h).status_code, 403)
+    def test_admin_allowed_but_source_required(self):
+        self.fake.roles = ("admin",)
+        self.assertEqual(self.c.post("/api/admin/pesticides", headers=self.h, json=self.PEST).status_code, 200)
+        self.assertEqual(self.c.post("/api/admin/pesticides", headers=self.h, json={**self.PEST, "source_name": ""}).status_code, 422)
+    def test_assistant_off_without_key(self):
+        self.assertEqual(self.c.post("/api/assistant", headers=self.h, json={"message": "hi"}).status_code, 503)
+if __name__ == "__main__": unittest.main()
